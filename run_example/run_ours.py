@@ -1,4 +1,6 @@
 import argparse
+import os
+import sys
 import random
 
 import gym
@@ -6,7 +8,6 @@ import d4rl
 
 import numpy as np
 import torch
-
 
 from offlinerlkit.nets import MLP
 from offlinerlkit.modules import ActorProb, Critic, TanhDiagGaussian, EnsembleDynamicsModel
@@ -17,68 +18,65 @@ from offlinerlkit.utils.load_dataset import qlearning_dataset
 from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.utils.logger import Logger, make_log_dirs
 from offlinerlkit.policy_trainer import MBPolicyTrainer
-from offlinerlkit.policy import MOBILEPolicy
 
+# Import our custom policy
+from offlinerlkit.policy import UncertaintyAwareCOMBOPolicy
 
 """
-suggested hypers
-halfcheetah-random-v2: rollout-length=5, penalty-coef=0.5
-hopper-random-v2: rollout-length=5, penalty-coef=5.0
-walker2d-random-v2: rollout-length=5, penalty-coef=2.0
-halfcheetah-medium-v2: rollout-length=5, penalty-coef=0.5
-hopper-medium-v2: rollout-length=5, penalty-coef=1.5 auto-alpha=False
-walker2d-medium-v2: rollout-length=5, penalty-coef=0.5
-halfcheetah-medium-replay-v2: rollout-length=5, penalty-coef=0.1
-hopper-medium-replay-v2: rollout-length=5, penalty-coef=0.1
-walker2d-medium-replay-v2: rollout-length=1, penalty-coef=0.5
-halfcheetah-medium-expert-v2: rollout-length=5, penalty-coef=2.0
-hopper-medium-expert-v2: rollout-length=5, penalty-coef=1.5
-walker2d-medium-expert-v2: rollout-length=1, penalty-coef=1.5
+Suggested Hyperparameters for Our Method:
+Since we add uncertainty penalty to the CQL weight, we might want to:
+1. Start with standard COMBO hyperparameters.
+2. Set penalty-coef (beta) to a reasonable value (e.g., 0.5 ~ 5.0).
 """
-
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algo-name", type=str, default="mobile")
-    # parser.add_argument("--task", type=str, default="walker2d-medium-expert-v2")
+    parser.add_argument("--algo-name", type=str, default="ours_adaptive_combo")
     parser.add_argument("--task", type=str, default="hopper-medium-v2")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
-    parser.add_argument("--hidden-dims", type=int, nargs='*', default=[256, 256])
+    parser.add_argument("--hidden-dims", type=int, nargs='*', default=[256, 256, 256])
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--alpha", type=float, default=0.2)
-    parser.add_argument("--auto-alpha", type=bool, default=True)
+    parser.add_argument("--auto-alpha", default=True)
     parser.add_argument("--target-entropy", type=int, default=None)
     parser.add_argument("--alpha-lr", type=float, default=1e-4)
 
-    parser.add_argument("--num-q-ensemble", type=int, default=2)
-    parser.add_argument("--deterministic-backup", type=bool, default=True)
+    # COMBO Params
+    parser.add_argument("--cql-weight", type=float, default=5.0) # Base conservatism
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--max-q-backup", type=bool, default=False)
-    parser.add_argument("--norm-reward", type=bool, default=False)
+    parser.add_argument("--deterministic-backup", type=bool, default=True)
+    parser.add_argument("--with-lagrange", type=bool, default=False)
+    parser.add_argument("--lagrange-threshold", type=float, default=10.0)
+    parser.add_argument("--cql-alpha-lr", type=float, default=3e-4)
+    parser.add_argument("--num-repeat-actions", type=int, default=10)
+    parser.add_argument("--uniform-rollout", type=bool, default=False)
+    parser.add_argument("--rho-s", type=str, default="mix", choices=["model", "mix"])
 
+    # MOBILE / Our Params
+    parser.add_argument("--penalty-coef", type=float, default=1.0) # Scale of adaptive weight
+    parser.add_argument("--num-samples", type=int, default=10)     # Samples for uncertainty calc
+
+    # Dynamics Params
     parser.add_argument("--dynamics-lr", type=float, default=1e-3)
-    parser.add_argument("--max-epochs-since-update", type=int, default=5)
-    parser.add_argument("--dynamics-max-epochs", type=int, default=30)
     parser.add_argument("--dynamics-hidden-dims", type=int, nargs='*', default=[200, 200, 200, 200])
     parser.add_argument("--dynamics-weight-decay", type=float, nargs='*', default=[2.5e-5, 5e-5, 7.5e-5, 7.5e-5, 1e-4])
     parser.add_argument("--n-ensemble", type=int, default=7)
     parser.add_argument("--n-elites", type=int, default=5)
     parser.add_argument("--rollout-freq", type=int, default=1000)
     parser.add_argument("--rollout-batch-size", type=int, default=50000)
-    parser.add_argument("--rollout-length", type=int, default=1)
-    parser.add_argument("--penalty-coef", type=float, default=1.5)
-    parser.add_argument("--num-samples", type=int, default=10)
+    parser.add_argument("--rollout-length", type=int, default=5)
     parser.add_argument("--model-retain-epochs", type=int, default=5)
-    parser.add_argument("--real-ratio", type=float, default=0.05)
+    parser.add_argument("--real-ratio", type=float, default=0.5)
     parser.add_argument("--load-dynamics-path", type=str, default=None)
 
     parser.add_argument("--epoch", type=int, default=1000)
     parser.add_argument("--step-per-epoch", type=int, default=1000)
     parser.add_argument("--eval_episodes", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr-scheduler", type=bool, default=True)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     return parser.parse_args()
@@ -87,21 +85,12 @@ def get_args():
 def train(args=get_args()):
     # create env and dataset
     env = gym.make(args.task)
-    """
-    Here we use our own implementation of qlearning_dataset for mbrl algos.
-    This is because for the d4rl.qlearning_dataset, it will take the obs[i+1] as the next obs,
-    which though has no effect for q learning but leads bug for dynamics learning.
-    However, I can only ensure our new implementation works well on Mujoco. I don't test it on other tasks like Antmaze.
-    Therefore, I suggest you to use the original impl if you run those tasks.
-    """
+    
     if 'hopper' in args.task or 'halfcheetah' in args.task or 'walker2d' in args.task:
         dataset = qlearning_dataset(env)
     else:
         dataset = d4rl.qlearning_dataset(env)
-    if args.norm_reward:
-        r_mean, r_std = dataset["rewards"].mean(), dataset["rewards"].std()
-        dataset["rewards"] = (dataset["rewards"] - r_mean) / (r_std + 1e-3)
-
+    
     args.obs_shape = env.observation_space.shape
     args.action_dim = np.prod(env.action_space.shape)
     args.max_action = env.action_space.high[0]
@@ -116,6 +105,8 @@ def train(args=get_args()):
 
     # create policy model
     actor_backbone = MLP(input_dim=np.prod(args.obs_shape), hidden_dims=args.hidden_dims)
+    critic1_backbone = MLP(input_dim=np.prod(args.obs_shape) + args.action_dim, hidden_dims=args.hidden_dims)
+    critic2_backbone = MLP(input_dim=np.prod(args.obs_shape) + args.action_dim, hidden_dims=args.hidden_dims)
     dist = TanhDiagGaussian(
         latent_dim=getattr(actor_backbone, "output_dim"),
         output_dim=args.action_dim,
@@ -124,25 +115,18 @@ def train(args=get_args()):
         max_mu=args.max_action
     )
     actor = ActorProb(actor_backbone, dist, args.device)
+    critic1 = Critic(critic1_backbone, args.device)
+    critic2 = Critic(critic2_backbone, args.device)
     actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
-    critics = []
-    for i in range(args.num_q_ensemble):
-        critic_backbone = MLP(input_dim=np.prod(args.obs_shape) + args.action_dim, hidden_dims=args.hidden_dims)
-        critics.append(Critic(critic_backbone, args.device))
-    critics = torch.nn.ModuleList(critics)
-    critics_optim = torch.optim.Adam(critics.parameters(), lr=args.critic_lr)
+    critic1_optim = torch.optim.Adam(critic1.parameters(), lr=args.critic_lr)
+    critic2_optim = torch.optim.Adam(critic2.parameters(), lr=args.critic_lr)
 
-    if args.lr_scheduler:
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
-    else:
-        lr_scheduler = None
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
 
     if args.auto_alpha:
         target_entropy = args.target_entropy if args.target_entropy \
             else -np.prod(env.action_space.shape)
-
         args.target_entropy = target_entropy
-
         log_alpha = torch.zeros(1, requires_grad=True, device=args.device)
         alpha_optim = torch.optim.Adam([log_alpha], lr=args.alpha_lr)
         alpha = (target_entropy, log_alpha, alpha_optim)
@@ -176,20 +160,32 @@ def train(args=get_args()):
     if args.load_dynamics_path:
         dynamics.load(args.load_dynamics_path)
 
-    # create policy
-    policy = MOBILEPolicy(
+    # create policy (OURS)
+    policy = UncertaintyAwareCOMBOPolicy(
         dynamics,
         actor,
-        critics,
+        critic1,
+        critic2,
         actor_optim,
-        critics_optim,
+        critic1_optim,
+        critic2_optim,
+        action_space=env.action_space,
         tau=args.tau,
         gamma=args.gamma,
         alpha=alpha,
-        penalty_coef=args.penalty_coef,
-        num_samples=args.num_samples,
+        cql_weight=args.cql_weight,
+        temperature=args.temperature,
+        max_q_backup=args.max_q_backup,
         deterministic_backup=args.deterministic_backup,
-        max_q_backup=args.max_q_backup
+        with_lagrange=args.with_lagrange,
+        lagrange_threshold=args.lagrange_threshold,
+        cql_alpha_lr=args.cql_alpha_lr,
+        num_repeart_actions=args.num_repeat_actions,
+        uniform_rollout=args.uniform_rollout,
+        rho_s=args.rho_s,
+        # Our params
+        penalty_coef=args.penalty_coef,
+        num_samples=args.num_samples
     )
 
     # create buffer
@@ -202,7 +198,6 @@ def train(args=get_args()):
         device=args.device
     )
     real_buffer.load_dataset(dataset)
-
     fake_buffer = ReplayBuffer(
         buffer_size=args.rollout_batch_size*args.rollout_length*args.model_retain_epochs,
         obs_shape=args.obs_shape,
@@ -213,8 +208,7 @@ def train(args=get_args()):
     )
 
     # log
-    log_dirs = make_log_dirs(args.task, args.algo_name, args.seed, vars(args), record_params=["penalty_coef", "rollout_length", "real_ratio"])
-    # key: output file name, value: output handler type
+    log_dirs = make_log_dirs(args.task, args.algo_name, args.seed, vars(args), record_params=["cql_weight", "penalty_coef"])
     output_config = {
         "consoleout_backup": "stdout",
         "policy_training_progress": "csv",
@@ -242,12 +236,7 @@ def train(args=get_args()):
 
     # train
     if not load_dynamics_model:
-        dynamics.train(
-            real_buffer.sample_all(),
-            logger,
-            max_epochs_since_update=args.max_epochs_since_update,
-            max_epochs=args.dynamics_max_epochs
-        )
+        dynamics.train(real_buffer.sample_all(), logger, max_epochs_since_update=5)
     
     policy_trainer.train()
 
